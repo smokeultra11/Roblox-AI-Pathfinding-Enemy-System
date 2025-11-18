@@ -1,1 +1,338 @@
+--[[
+    GELİŞMİŞ VE OPTİMİZE EDİLMİŞ ROBLOX NPC AI (R6 UYUMLU)
+    ----------------------------------------------------------------
+    Düzeltmeler:
+    - Network Ownership (Akıcılık sorunu çözüldü)
+    - Animasyon Sistemi Eklendi (Idle, Walk, Run, Attack)
+    - Waypoint geçiş mantığı iyileştirildi
+]]
 
+local CollectionService = game:GetService("CollectionService")
+local PathfindingService = game:GetService("PathfindingService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+-- ==============================================================================
+-- [1] AYARLAR
+-- ==============================================================================
+local CONFIG = {
+	-- Hareket
+	WalkSpeed = 10,
+	RunSpeed = 20,
+	SightRange = 50,
+	AttackRange = 5,
+	FleeThreshold = 30,     -- Can %30 altındaysa kaç
+
+	-- Davranış
+	Aggressive = true,
+	PatrolRadius = 40,
+	IdleTime = {Min = 2, Max = 4},
+	InteractTag = "Interactable",
+
+	-- Animasyon ID'leri (R6 İçin Örnek ID'ler - Kendi ID'lerinizi buraya girin)
+	-- Eğer animasyonlarınız yoksa Roblox'un default ID'lerini kullanın:
+	-- http://www.roblox.com/asset/?id=180435571 (Run) gibi.
+	Animations = {
+		IDLE = "rbxassetid://180435571", -- Standart R6 Idle
+		WALK = "rbxassetid://180426354", -- Standart R6 Walk
+		RUN = "rbxassetid://180426354",  -- Koşma için de Walk kullanıp hızlandıracağız
+		ATTACK = "rbxassetid://203992968", -- Örnek bir vuruş animasyonu
+	},
+
+	-- Teknik
+	WaypointSpacing = 4,
+	WaypointThreshold = 3, -- Sonraki noktaya geçiş mesafesi (Takılmayı önler)
+	DebugMode = true
+}
+
+-- ==============================================================================
+-- [2] DEĞİŞKENLER
+-- ==============================================================================
+local npc = script.Parent
+local humanoid = npc:WaitForChild("Humanoid")
+local rootPart = npc:WaitForChild("HumanoidRootPart")
+local animator = humanoid:WaitForChild("Animator")
+
+-- Fizik Sahipliğini Sunucuya Al (TİTREME ÇÖZÜMÜ)
+-- Bu satır NPC'nin istemciler arasında gidip gelmesini ve donmasını engeller.
+rootPart:SetNetworkOwner(nil)
+
+local STATES = { IDLE="IDLE", PATROL="PATROL", CHASE="CHASE", FLEE="FLEE", INTERACT="INTERACT" }
+local currentState = STATES.IDLE
+local currentTarget = nil
+
+-- Pathfinding
+local path = PathfindingService:CreatePath({
+	AgentRadius = 2,
+	AgentHeight = 5,
+	AgentCanJump = true,
+	WaypointSpacing = CONFIG.WaypointSpacing,
+	Costs = { Water = 20 }
+})
+local waypoints = {}
+local currentWaypointIndex = 2
+
+-- Animasyonlar için Tablo
+local loadedAnims = {}
+local currentAnimTrack = nil
+
+-- Zamanlayıcılar
+local lastPathCalc = 0
+local lastStateCheck = 0
+local isIdling = false
+
+-- ==============================================================================
+-- [3] ANİMASYON SİSTEMİ
+-- ==============================================================================
+local function loadAnimations()
+	for name, id in pairs(CONFIG.Animations) do
+		local animObj = Instance.new("Animation")
+		animObj.AnimationId = id
+		-- Hata yönetimi: Eğer ID geçersizse script çökmesin
+		local success, track = pcall(function()
+			return animator:LoadAnimation(animObj)
+		end)
+		if success then
+			loadedAnims[name] = track
+		end
+	end
+end
+
+local function playAnimation(animName, speed)
+	speed = speed or 1
+	local newTrack = loadedAnims[animName]
+
+	if not newTrack then return end
+	if currentAnimTrack == newTrack and currentAnimTrack.IsPlaying then 
+		currentAnimTrack:AdjustSpeed(speed) -- Sadece hız güncelle
+		return 
+	end
+
+	if currentAnimTrack then
+		currentAnimTrack:Stop(0.2) -- Yumuşak geçiş
+	end
+
+	newTrack:Play(0.2)
+	newTrack:AdjustSpeed(speed)
+	currentAnimTrack = newTrack
+end
+
+local function updateMovementAnimation()
+	-- NPC hareket ediyor mu? (Velocity büyüklüğü 0.1'den büyükse)
+	local speed = rootPart.Velocity.Magnitude
+
+	if currentState == STATES.CHASE or currentState == STATES.FLEE then
+		-- Koşuyorsa
+		if speed > 1 then
+			playAnimation("RUN", 1.5) -- Hızlı oynat
+		else
+			playAnimation("IDLE")
+		end
+	elseif speed > 1 then
+		-- Yürüyorsa
+		playAnimation("WALK", 1) 
+	else
+		-- Duruyorsa
+		playAnimation("IDLE")
+	end
+end
+
+-- ==============================================================================
+-- [4] HAREKET VE PATHFINDING
+-- ==============================================================================
+
+local function visualizeWaypoints(points)
+	if not CONFIG.DebugMode then return end
+	-- Önceki debug parçalarını temizlemiyoruz (performans için), sadece yenileri ekliyoruz
+	-- Gerçek oyunda burayı kapatın.
+	for i, wp in ipairs(points) do
+		if i > 1 then -- İlk nokta zaten olduğumuz yer
+			local p = Instance.new("Part")
+			p.Size = Vector3.new(0.5,0.5,0.5)
+			p.Position = wp.Position
+			p.Anchored = true
+			p.CanCollide = false
+			p.Material = Enum.Material.Neon
+			p.Color = Color3.fromRGB(0, 255, 100)
+			p.Parent = workspace
+			Debris:AddItem(p, 2) -- 2 saniye sonra sil
+		end
+	end
+end
+
+local function computePathTo(destination)
+	local success, err = pcall(function()
+		path:ComputeAsync(rootPart.Position, destination)
+	end)
+
+	if success and path.Status == Enum.PathStatus.Success then
+		waypoints = path:GetWaypoints()
+		currentWaypointIndex = 2 -- 1. nokta mevcut konumdur, 2'ye gitmeliyiz
+		visualizeWaypoints(waypoints)
+		return true
+	end
+	return false
+end
+
+local function moveToNextWaypoint()
+	if currentWaypointIndex > #waypoints then return false end -- Yol bitti
+
+	local waypoint = waypoints[currentWaypointIndex]
+
+	-- Zıplama
+	if waypoint.Action == Enum.PathWaypointAction.Jump then
+		humanoid.Jump = true
+	end
+
+	humanoid:MoveTo(waypoint.Position)
+
+	-- YENİ MESAFE KONTROLÜ (Sadece X ve Z eksenine bak, Y'yi yoksay)
+	-- Bu, NPC'nin hafif tümseklerde veya rampalarda takılmasını önler.
+	local targetPos = Vector3.new(waypoint.Position.X, 0, waypoint.Position.Z)
+	local currentPos = Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z)
+
+	if (targetPos - currentPos).Magnitude < CONFIG.WaypointThreshold then
+		currentWaypointIndex = currentWaypointIndex + 1
+	end
+
+	return true
+end
+
+-- ==============================================================================
+-- [5] MANTIK (Logic)
+-- ==============================================================================
+
+local function getClosestPlayer()
+	local closest, dist = nil, CONFIG.SightRange
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player.Character and player.Character:FindFirstChild("HumanoidRootPart") and player.Character.Humanoid.Health > 0 then
+			local d = (rootPart.Position - player.Character.HumanoidRootPart.Position).Magnitude
+			if d < dist then
+				-- Basit Raycast (Duvar arkasını görmesin)
+				local params = RaycastParams.new()
+				params.FilterDescendantsInstances = {npc}
+				params.FilterType = Enum.RaycastFilterType.Exclude
+				local result = workspace:Raycast(rootPart.Position, (player.Character.HumanoidRootPart.Position - rootPart.Position).Unit * d, params)
+
+				if result and result.Instance:IsDescendantOf(player.Character) then
+					dist = d
+					closest = player.Character
+				end
+			end
+		end
+	end
+	return closest
+end
+
+local function updateState()
+	local target = getClosestPlayer()
+	local hpPercent = (humanoid.Health / humanoid.MaxHealth) * 100
+
+	-- KAÇMA
+	if hpPercent < CONFIG.FleeThreshold and target then
+		currentState = STATES.FLEE
+		currentTarget = target
+		return
+	end
+
+	-- KOVALAMA / SALDIRI
+	if target then
+		currentState = CONFIG.Aggressive and STATES.CHASE or STATES.IDLE
+		currentTarget = target
+		return
+	end
+
+	-- DEVRİYE
+	if currentState ~= STATES.PATROL and not isIdling then
+		currentState = STATES.PATROL
+	end
+end
+
+-- ==============================================================================
+-- [6] MAIN LOOP (Heartbeat)
+-- ==============================================================================
+
+-- Animasyonları yükle
+loadAnimations()
+
+RunService.Heartbeat:Connect(function(dt)
+	lastStateCheck = lastStateCheck + dt
+	lastPathCalc = lastPathCalc + dt
+
+	-- 1. Durum Kontrolü (Saniyede 2-3 kez yeterli)
+	if lastStateCheck > 0.5 then
+		updateState()
+		lastStateCheck = 0
+	end
+
+	-- 2. Animasyon Güncellemesi (Her frame)
+	updateMovementAnimation()
+
+	-- 3. Durum Davranışları
+	if currentState == STATES.IDLE then
+		humanoid:MoveTo(rootPart.Position) -- Dur
+		if not isIdling then
+			isIdling = true
+			task.delay(math.random(CONFIG.IdleTime.Min, CONFIG.IdleTime.Max), function()
+				isIdling = false
+				currentState = STATES.PATROL -- Bekleme bitince devriyeye dön
+			end)
+		end
+
+	elseif currentState == STATES.PATROL then
+		humanoid.WalkSpeed = CONFIG.WalkSpeed
+		-- Hedef yoksa veya yol bittiyse yeni nokta bul
+		if currentWaypointIndex > #waypoints or not waypoints[currentWaypointIndex] then
+			local randomPt = rootPart.Position + Vector3.new(math.random(-CONFIG.PatrolRadius, CONFIG.PatrolRadius), 0, math.random(-CONFIG.PatrolRadius, CONFIG.PatrolRadius))
+			if computePathTo(randomPt) then lastPathCalc = 0 end
+		end
+		moveToNextWaypoint()
+
+	elseif currentState == STATES.CHASE then
+		humanoid.WalkSpeed = CONFIG.RunSpeed
+		if currentTarget then
+			local dist = (rootPart.Position - currentTarget.HumanoidRootPart.Position).Magnitude
+
+			if dist < CONFIG.AttackRange then
+				humanoid:MoveTo(rootPart.Position)
+				-- SALDIRI ANİMASYONU BURADA OYNATILABİLİR
+				-- playAnimation("ATTACK") 
+				-- Hasar verme kodu buraya
+			else
+				-- Hedef hareketli olduğu için yolu sık güncelle
+				if lastPathCalc > 0.5 then -- Her 0.5 saniyede bir güncelle
+					computePathTo(currentTarget.HumanoidRootPart.Position)
+					lastPathCalc = 0
+				end
+				moveToNextWaypoint()
+			end
+		else
+			currentState = STATES.PATROL
+		end
+
+	elseif currentState == STATES.FLEE then
+		humanoid.WalkSpeed = CONFIG.RunSpeed
+		if currentTarget then
+			local dir = (rootPart.Position - currentTarget.HumanoidRootPart.Position).Unit
+			local fleePos = rootPart.Position + (dir * 30)
+			if lastPathCalc > 1 then
+				computePathTo(fleePos)
+				lastPathCalc = 0
+			end
+			moveToNextWaypoint()
+		end
+	end
+end)
+
+-- Yolu engelleyen bir şey olursa (Kapı kapanması vb.)
+path.Blocked:Connect(function(idx)
+	if idx >= currentWaypointIndex then
+		-- Yolu tekrar hesapla
+		if currentTarget and currentState == STATES.CHASE then
+			computePathTo(currentTarget.HumanoidRootPart.Position)
+		end
+	end
+end)
+
+print("NPC AI Başlatıldı: Network Owner ve Animasyonlar Aktif.")
